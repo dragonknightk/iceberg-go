@@ -220,6 +220,9 @@ type DataFileStatistics struct {
 	// one row group. Key presence blocks partition inference. The value is the
 	// partial aggregate from the other row groups and may be nil.
 	incompleteBounds map[int]StatsAgg
+	// unwrittenBounds holds complete bounds that the metrics mode (none or
+	// counts) keeps out of the manifest. Partition inference still uses them.
+	unwrittenBounds  map[int]StatsAgg
 	SplitOffsets     []int64
 	EqualityFieldIDs []int
 	// Variant bounds: serialized variant objects keyed by parent variant field id.
@@ -232,7 +235,7 @@ type DataFileStatistics struct {
 // bounds when inferring a value.
 func (d *DataFileStatistics) PartitionValue(field iceberg.PartitionField, sc *iceberg.Schema) any {
 	sourceID := field.FirstSourceID()
-	agg := d.ColAggs[sourceID]
+	agg := d.completeBounds(sourceID)
 	if agg == nil {
 		agg = d.incompleteBounds[sourceID]
 	}
@@ -251,6 +254,14 @@ func (d *DataFileStatistics) PartitionValue(field iceberg.PartitionField, sc *ic
 	}
 
 	return d.partitionValueWithSourceType(field, agg, sourceField.Type)
+}
+
+func (d *DataFileStatistics) completeBounds(sourceID int) StatsAgg {
+	if agg := d.ColAggs[sourceID]; agg != nil {
+		return agg
+	}
+
+	return d.unwrittenBounds[sourceID]
 }
 
 func (d *DataFileStatistics) partitionValueWithSourceType(field iceberg.PartitionField, agg StatsAgg, sourceType iceberg.Type) any {
@@ -322,7 +333,7 @@ func (d *DataFileStatistics) ToDataFile(opts DataFileOpts) iceberg.DataFile {
 						iceberg.ErrInvalidArgument, field.Name, field.FieldID))
 				}
 				fieldIDToPartitionData[field.FieldID] = d.partitionValueWithSourceType(
-					field, d.ColAggs[field.FirstSourceID()], sourceField.Type)
+					field, d.completeBounds(field.FirstSourceID()), sourceField.Type)
 			case field.Transform.PreservesOrder():
 				// Preserve the existing error path for an invalid schema. This branch
 				// is not part of the valid hot path because sourceFieldFound is false.

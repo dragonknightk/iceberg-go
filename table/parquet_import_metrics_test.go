@@ -343,3 +343,56 @@ func TestWriteNullPartitionWithoutParquetStatistics(t *testing.T) {
 	assert.Equal(t, map[int]any{1000: nil}, files[0].File.Partition())
 	assert.NotContains(t, files[0].File.NullValueCounts(), 1)
 }
+
+// Issue 2716: metrics modes none and counts only control what the manifest
+// stores. Partition inference still reads the Parquet footer, so it must give
+// the same amount=7 partition as full mode instead of a null partition.
+func TestImportPartitionInferenceIgnoresMetricsMode(t *testing.T) {
+	value := int32(7)
+	schema := iceberg.NewSchema(0, iceberg.NestedField{ID: 1, Name: "amount", Type: iceberg.PrimitiveTypes.Int32})
+	spec := iceberg.NewPartitionSpecID(0, iceberg.PartitionField{SourceIDs: []int{1}, FieldID: 1000, Name: "amount", Transform: iceberg.IdentityTransform{}})
+	for _, mode := range []string{"none", "counts", "full"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx := t.Context()
+			props := iceberg.Properties{table.MetricsModeColumnConfPrefix + ".amount": mode}
+			path := writePartialMetricsParquet(t, schema, [][]*int32{{&value, &value}}, "")
+			cat, err := hadoop.NewCatalog(ctx, "local", t.TempDir(), nil)
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, cat.Close()) })
+			require.NoError(t, cat.CreateNamespace(ctx, catalog.ToIdentifier("db"), nil))
+			tbl, err := cat.CreateTable(ctx, catalog.ToIdentifier("db", "amounts"), schema,
+				catalog.WithPartitionSpec(&spec), catalog.WithProperties(props))
+			require.NoError(t, err)
+			txn := tbl.NewTransaction()
+			require.NoError(t, txn.AddDataFilesByPath(ctx, []string{path}, nil, false))
+			tbl, err = txn.Commit(ctx)
+			require.NoError(t, err)
+
+			files, err := tbl.Scan().PlanFiles(ctx)
+			require.NoError(t, err)
+			require.Len(t, files, 1)
+			imported := files[0].File
+			assert.Equal(t, map[int]any{1000: value}, imported.Partition())
+			// The metrics mode still decides which metrics reach the manifest.
+			_, hasNulls := imported.NullValueCounts()[1]
+			_, hasLower := imported.LowerBoundValues()[1]
+			_, hasUpper := imported.UpperBoundValues()[1]
+			assert.Equal(t, mode != "none", hasNulls)
+			assert.Equal(t, mode == "full", hasLower)
+			assert.Equal(t, mode == "full", hasUpper)
+
+			result, err := tbl.Scan(table.WithRowFilter(iceberg.EqualTo(iceberg.Reference("amount"), value))).ToArrowTable(ctx)
+			require.NoError(t, err)
+			defer result.Release()
+			assert.EqualValues(t, 2, result.NumRows())
+
+			// Footer bounds still check a supplied value and still block
+			// inference when a row group lacks them.
+			_, err = table.FileToDataFileWithOptions(ctx, iceio.LocalFS{}, path, schema, spec, 0, props, table.WithFilePartitionValues(map[int]any{1000: int32(8)}))
+			require.ErrorContains(t, err, "does not match Parquet bounds")
+			partial := writePartialMetricsParquet(t, schema, [][]*int32{{&value}, {&value}}, "min_max")
+			_, err = table.FileToDataFile(ctx, iceio.LocalFS{}, partial, schema, spec, 0, props)
+			require.ErrorContains(t, err, "incomplete Parquet bounds")
+		})
+	}
+}
